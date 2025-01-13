@@ -4,14 +4,18 @@ from torch.nn import functional as F
 
 # hyperparameters
 BATCH_SIZE = 32
-BLOCK_SIZE = 8
+BLOCK_SIZE = 128
 MAX_ITERS = 5000
 EVAL_INTERVAL = 300
-LR = 1e-3
+LR = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'device: {device}')
 EVAL_ITERS = 200
-N_EMBD = 32
+PER_HEAD_DIM = 64
+N_HEAD = 6
+N_LAYER = 5
+N_EMBD = N_HEAD * PER_HEAD_DIM # so that every head is 64 dimensional
+DROPOUT = 0.2
 
 torch.manual_seed(1337)
 
@@ -84,13 +88,47 @@ class Head(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     # multiple attnetion heads in parallel
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_head, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
+        self.proj = nn.Linear(N_EMBD, N_EMBD)
+        self.dropout = nn.Dropout(DROPOUT)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class FeedForward(nn.Module):
+    # linear layer followed by non linearity
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(DROPOUT)
+        )
     
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
-
+        return self.net(x)
+    
+class Block(nn.Module):
+    # Transformer block
+    def __init__(self, n_embd, n_head):
+        # n_embd: embedding dimension
+        # n_head: number of heads we'd like
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+    
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 
 class BigramLanguageModel(nn.Module):
@@ -99,7 +137,8 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, N_EMBD)
         self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBD)
-        self.sa_heads = MultiHeadAttention(4, N_EMBD//4) # sa self attention
+        self.blocks = nn.Sequential(*[Block(N_EMBD, n_head=N_HEAD) for _ in range(N_LAYER)])
+        self.ln_f = nn.LayerNorm(N_EMBD) # layer norm final
         self.lm_head = nn.Linear(N_EMBD, vocab_size) # lm language model
 
 
@@ -109,7 +148,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B, T, C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = tok_emb + pos_emb # (B, T, C)
-        x = self.sa_heads(x)
+        x = self.blocks(x)
         logits = self.lm_head(x) # (B, T, vocab_size))
 
         if targets is None:
@@ -168,3 +207,4 @@ for iter in range(MAX_ITERS):
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+open('out2.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
